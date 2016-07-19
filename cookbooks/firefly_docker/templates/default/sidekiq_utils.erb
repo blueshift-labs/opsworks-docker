@@ -1,0 +1,90 @@
+#!/bin/bash
+
+QUEUE_NAME=$1
+
+function get_queue_size
+{	
+	METRIC_NAME="<%=@app%>.sidekiq.queues.${QUEUE_NAME}.size"
+
+	TO_TIME=$(date  +%s)
+	FROM_TIME=$(date --date='10 seconds ago' +%s)
+	query_datadog=`curl -G \
+	    "https://app.datadoghq.com/api/v1/query" \
+	    -d "api_key=<%=@dd_api_key%>" \
+	    -d "application_key=<%=@dd_app_key%>" \
+	    -d "from=${FROM_TIME}" \
+	    -d "to=${TO_TIME}" \
+	    -d "query=avg:${METRIC_NAME}{*}"`
+
+	points_list=`echo $query_datadog | python -c "import json,sys;obj=json.load(sys.stdin);print obj['series'];"`
+
+	if [ "$points_list" != "[]" ];then
+		queue_size=`echo "$query_datadog" | python -c "import json,sys;obj=json.load(sys.stdin);print obj['series'][0]['pointlist'][0][1];"`
+		queue_size=${queue_size%%.*}
+	else
+		queue_size=0
+	fi
+	echo $queue_size
+}
+
+function condition_scale_up
+{
+  	local queue_size=$(get_queue_size)
+  	local cpu_usage=`top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}'`
+  	cpu_usage=${cpu_usage%%.*}
+
+      if [ "$queue_size" -gt <%=@queue_scale_up%> ] && [ "$cpu_usage" -lt 80 ];then
+        return 0             
+      else
+      	return 1
+      fi
+}
+
+function condition_scale_down
+{
+  	local queue_size=$(get_queue_size)
+      if [ "$queue_size" -lt <%=@queue_scale_down%> ];then
+        return 0             
+      else
+      	return 1
+      fi
+}
+
+function cool_down 
+{
+	sleep 120
+}
+
+function scale_containers
+{
+	CONTAINER_NAME="<%=@container_name%>_${QUEUE_NAME}"
+	
+	condition_scale_up
+	if [ $? == 0 ];then
+		echo "scale up"
+
+		EXCLUSIVE_CONFIG="config/sidekiq_exclusive_${QUEUE_NAME}.yml"
+
+		CREATE_EXCLUSIVE_CONFIG="{ cat config/sidekiq.yml | grep -B 100 'queues'; echo -e '  - ${QUEUE_NAME}'; } > ${EXCLUSIVE_CONFIG}; chmod 644 $EXCLUSIVE_CONFIG"
+		
+		exec_cmd="cd <%=@app_root%>; $CREATE_EXCLUSIVE_CONFIG; bundle exec sidekiq -g <%=@sidekiq_tag%> -C $EXCLUSIVE_CONFIG" 
+		
+		docker run <%=@dockerenvs%> -d --name ${CONTAINER_NAME}_$(date +%s) --user=<%=@app_user%> <%=@registry%>/<%=@repo%>:<%=@repo_tag%>  /bin/bash -i -c "$exec_cmd" 
+		
+		cool_down
+	fi
+
+	condition_scale_down
+	if [ $? == 0 ];then
+		echo "scale down"
+	 	if docker ps -a | awk '{print $NF}' | grep ${CONTAINER_NAME}; 
+	      then
+	        docker ps -a | awk '{print $NF}' | grep ${CONTAINER_NAME} | awk 'NR==1{print $1}' | xargs docker stop 
+	        sleep 3
+	        docker ps -a | awk '{print $NF}' | grep ${CONTAINER_NAME} | awk 'NR==1{print $1}' | xargs docker rm -f
+	        sleep 3
+	        cool_down
+	    fi
+	fi
+}
+scale_containers
